@@ -100,33 +100,49 @@ app.get("/webhook", (req, res) => {
 
 // POST /webhook — incoming messages from WhatsApp
 app.post("/webhook", async (req, res) => {
-  // Acknowledge immediately so Meta doesn't retry
-  res.sendStatus(200);
+  console.log("[webhook] POST received");
+  console.log("[webhook] body:", JSON.stringify(req.body));
 
   try {
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
 
+    console.log("[webhook] value.messages:", value?.messages ? "present" : "absent");
+
     // Ignore status updates (delivered, read, etc.)
-    if (!value?.messages) return;
+    if (!value?.messages) {
+      console.log("[webhook] no messages field — ignoring");
+      return res.sendStatus(200);
+    }
 
     const message = value.messages[0];
+    console.log("[webhook] message.type:", message.type);
 
     // Only handle text messages for now
-    if (message.type !== "text") return;
+    if (message.type !== "text") {
+      console.log("[webhook] non-text message — ignoring");
+      return res.sendStatus(200);
+    }
 
-    const from = message.from; // sender's WhatsApp number
+    const from = message.from;
     const text = message.text.body;
+    console.log(`[webhook] from=${from} text="${text}"`);
 
-    console.log(`[${from}] ${text}`);
-
+    console.log("[webhook] calling Claude...");
     const reply = await getClaudeReply(from, text);
-    await sendWhatsAppMessage(from, reply);
+    console.log(`[webhook] Claude reply="${reply}"`);
 
-    console.log(`[bot → ${from}] ${reply}`);
+    console.log("[webhook] sending WhatsApp reply...");
+    await sendWhatsAppMessage(from, reply);
+    console.log(`[webhook] reply delivered to ${from}`);
+
+    // ACK sent last — on Vercel serverless the function stops when the
+    // response is flushed, so this must come after all async work.
+    res.sendStatus(200);
   } catch (err) {
-    console.error("Error handling webhook:", err?.response?.data ?? err.message);
+    console.error("[webhook] error:", err?.response?.data ?? err.message);
+    res.sendStatus(500);
   }
 });
 
