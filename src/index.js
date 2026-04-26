@@ -7,35 +7,80 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const SYSTEM_PROMPT =
-  "You are Sous, an AI food companion. You help users plan meals, order groceries, and book restaurants across Swiggy. Be conversational, helpful and concise. Never use markdown formatting like asterisks for bold/italics, hyphens for bullet points, or pound signs for headers. Use plain text only. For lists use simple numbered format like 1. 2. 3. You can use WhatsApp native formatting: *single asterisks for bold* and emojis are fine.";
+const SYSTEM_PROMPT = `You are Sous, an AI food companion. You help users plan meals, order groceries, and book restaurants across Swiggy. Be conversational, helpful and concise. Never use markdown formatting like asterisks for bold/italics, hyphens for bullet points, or pound signs for headers. Use plain text only. For lists use simple numbered format like 1. 2. 3. You can use WhatsApp native formatting: *single asterisks for bold* and emojis are fine.
+
+When you want to offer the user a choice between 2-3 options, respond with this exact JSON and nothing else:
+{"body":"your message here","buttons":["Option 1","Option 2","Option 3"]}
+Button titles must be 20 characters or less. For all other responses use plain text only.`;
+
+const WELCOME = {
+  body: "👋 Hey! I'm *Sous*, your AI food companion powered by Swiggy. What would you like to do?",
+  buttons: ["🍔 Order Food", "🛒 Get Groceries", "🍽️ Book a Table"],
+};
 
 // Per-user conversation history (in-memory; keyed by WhatsApp sender ID)
 const conversations = new Map();
-const MAX_HISTORY = 20; // keep last 20 messages per user
+const MAX_HISTORY = 20;
 
 // ── WhatsApp Cloud API helpers ────────────────────────────────────────────────
 
+function whatsappHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+}
+
+function whatsappUrl() {
+  console.log("[whatsapp] PHONE_NUMBER_ID:", process.env.PHONE_NUMBER_ID);
+  return `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+}
+
 async function sendWhatsAppMessage(to, text) {
-  console.log("[sendWhatsApp] PHONE_NUMBER_ID:", process.env.PHONE_NUMBER_ID);
+  console.log(`[sendText] to=${to} text="${text}"`);
   await axios.post(
-    `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
+    whatsappUrl(),
+    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
+    { headers: whatsappHeaders() }
   );
 }
 
-// ── Claude helper ─────────────────────────────────────────────────────────────
+async function sendWhatsAppButtons(to, bodyText, buttons) {
+  console.log(`[sendButtons] to=${to} body="${bodyText}" buttons=${JSON.stringify(buttons)}`);
+  const action = {
+    buttons: buttons.slice(0, 3).map((label, i) => ({
+      type: "reply",
+      reply: {
+        id: `btn_${i}_${label.toLowerCase().replace(/\W+/g, "_")}`.substring(0, 256),
+        title: label.substring(0, 20),
+      },
+    })),
+  };
+  await axios.post(
+    whatsappUrl(),
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: { type: "button", body: { text: bodyText }, action },
+    },
+    { headers: whatsappHeaders() }
+  );
+}
+
+// ── Claude helpers ────────────────────────────────────────────────────────────
+
+function parseClaudeResponse(raw) {
+  try {
+    const parsed = JSON.parse(raw.trim());
+    if (typeof parsed.body === "string" && Array.isArray(parsed.buttons) && parsed.buttons.length) {
+      return { body: parsed.body, buttons: parsed.buttons.slice(0, 3) };
+    }
+  } catch {
+    // plain text — fall through
+  }
+  return { body: raw, buttons: null };
+}
 
 async function getClaudeReply(userId, userMessage) {
   if (!conversations.has(userId)) {
@@ -45,7 +90,6 @@ async function getClaudeReply(userId, userMessage) {
   const history = conversations.get(userId);
   history.push({ role: "user", content: userMessage });
 
-  // Trim to MAX_HISTORY (keep pairs so history stays alternating)
   while (history.length > MAX_HISTORY) {
     history.splice(0, 2);
   }
@@ -53,24 +97,17 @@ async function getClaudeReply(userId, userMessage) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 1024,
-    // Cache the system prompt — saves tokens on every subsequent turn
-    system: [
-      {
-        type: "text",
-        text: SYSTEM_PROMPT,
-        cache_control: { type: "ephemeral" },
-      },
-    ],
+    system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
     messages: history,
   });
 
-  const reply =
+  const raw =
     response.content.find((b) => b.type === "text")?.text ??
     "Sorry, I couldn't generate a response. Please try again.";
 
-  history.push({ role: "assistant", content: reply });
+  history.push({ role: "assistant", content: raw });
 
-  return reply;
+  return parseClaudeResponse(raw);
 }
 
 // ── Debug routes ─────────────────────────────────────────────────────────────
@@ -85,7 +122,6 @@ app.get("/webhook-test", (req, res) => {
 
 // ── Webhook routes ────────────────────────────────────────────────────────────
 
-// GET  /webhook — verification handshake required by Meta
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -99,7 +135,6 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(403);
 });
 
-// POST /webhook — incoming messages from WhatsApp
 app.post("/webhook", async (req, res) => {
   console.log("[webhook] POST received");
   console.log("[webhook] body:", JSON.stringify(req.body));
@@ -111,7 +146,6 @@ app.post("/webhook", async (req, res) => {
 
     console.log("[webhook] value.messages:", value?.messages ? "present" : "absent");
 
-    // Ignore status updates (delivered, read, etc.)
     if (!value?.messages) {
       console.log("[webhook] no messages field — ignoring");
       return res.sendStatus(200);
@@ -120,26 +154,51 @@ app.post("/webhook", async (req, res) => {
     const message = value.messages[0];
     console.log("[webhook] message.type:", message.type);
 
-    // Only handle text messages for now
-    if (message.type !== "text") {
-      console.log("[webhook] non-text message — ignoring");
+    let from, userText;
+
+    if (message.type === "text") {
+      from = message.from;
+      userText = message.text.body;
+      console.log(`[webhook] text from=${from} text="${userText}"`);
+    } else if (message.type === "interactive") {
+      // User tapped a button
+      const reply = message.interactive?.button_reply;
+      if (!reply) {
+        console.log("[webhook] interactive but no button_reply — ignoring");
+        return res.sendStatus(200);
+      }
+      from = message.from;
+      userText = reply.title;
+      console.log(`[webhook] button reply from=${from} id="${reply.id}" title="${reply.title}"`);
+    } else {
+      console.log("[webhook] unhandled message type:", message.type, "— ignoring");
       return res.sendStatus(200);
     }
 
-    const from = message.from;
-    const text = message.text.body;
-    console.log(`[webhook] from=${from} text="${text}"`);
+    // First contact: send welcome buttons and stop — their next message starts the conversation
+    if (!conversations.has(from)) {
+      console.log("[webhook] new user — sending welcome");
+      await sendWhatsAppButtons(from, WELCOME.body, WELCOME.buttons);
+      // Initialise an empty history so the next message routes to Claude
+      conversations.set(from, []);
+      return res.sendStatus(200);
+    }
 
     console.log("[webhook] calling Claude...");
-    const reply = await getClaudeReply(from, text);
-    console.log(`[webhook] Claude reply="${reply}"`);
+    const { body, buttons } = await getClaudeReply(from, userText);
+    console.log(`[webhook] Claude body="${body}" buttons=${JSON.stringify(buttons)}`);
 
-    console.log("[webhook] sending WhatsApp reply...");
-    await sendWhatsAppMessage(from, reply);
+    if (buttons && buttons.length > 0) {
+      console.log("[webhook] sending interactive button message...");
+      await sendWhatsAppButtons(from, body, buttons);
+    } else {
+      console.log("[webhook] sending text message...");
+      await sendWhatsAppMessage(from, body);
+    }
+
     console.log(`[webhook] reply delivered to ${from}`);
 
-    // ACK sent last — on Vercel serverless the function stops when the
-    // response is flushed, so this must come after all async work.
+    // ACK last — Vercel terminates the function the moment the response is sent
     res.sendStatus(200);
   } catch (err) {
     console.error("[webhook] error:", err?.response?.data ?? err.message);
@@ -153,7 +212,5 @@ export default app;
 
 if (process.env.NODE_ENV === "development") {
   const PORT = process.env.PORT ?? 3000;
-  app.listen(PORT, () => {
-    console.log(`Sous bot listening on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`Sous bot listening on port ${PORT}`));
 }
