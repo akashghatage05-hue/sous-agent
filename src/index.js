@@ -8,7 +8,7 @@ app.use(express.json());
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const SYSTEM_PROMPT =
-  "You are Sous, an AI food companion. You help users plan meals, order groceries, and book restaurants across Swiggy. Be conversational, helpful and concise.";
+  "You are Sous, an AI food companion. You help users plan meals, order groceries, and book restaurants across Swiggy. Be conversational, helpful and concise. Never use markdown formatting like asterisks for bold/italics, hyphens for bullet points, or pound signs for headers. Use plain text only. For lists use simple numbered format like 1. 2. 3. You can use WhatsApp native formatting: *single asterisks for bold* and emojis are fine.";
 
 // Per-user conversation history (in-memory; keyed by WhatsApp sender ID)
 const conversations = new Map();
