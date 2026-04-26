@@ -1,4 +1,3 @@
-import "dotenv/config";
 import express from "express";
 import axios from "axios";
 import Anthropic from "@anthropic-ai/sdk";
@@ -135,7 +134,7 @@ app.post("/webhook", async (req, res) => {
 
 export default app;
 
-if (process.env.NODE_ENV !== "production") {
+if (process.env.NODE_ENV === "development") {
   const PORT = process.env.PORT ?? 3000;
   app.listen(PORT, () => {
     console.log(`Sous bot listening on port ${PORT}`);
