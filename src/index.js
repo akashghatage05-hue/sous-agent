@@ -17,8 +17,9 @@ const MAX_HISTORY = 20; // keep last 20 messages per user
 // ── WhatsApp Cloud API helpers ────────────────────────────────────────────────
 
 async function sendWhatsAppMessage(to, text) {
+  console.log("[sendWhatsApp] PHONE_NUMBER_ID:", process.env.PHONE_NUMBER_ID);
   await axios.post(
-    `https://graph.facebook.com/v21.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to,
