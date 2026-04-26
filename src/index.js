@@ -60,6 +60,18 @@ const FALLBACK_MESSAGES = [
 const conversations = new Map();
 const MAX_HISTORY = 20;
 
+// Deduplication: ignore duplicate webhook deliveries for the same message ID (60-second window)
+const seenMessageIds = new Map();
+function isDuplicateMessage(msgId) {
+  const now = Date.now();
+  for (const [id, ts] of seenMessageIds) {
+    if (now - ts > 60_000) seenMessageIds.delete(id);
+  }
+  if (seenMessageIds.has(msgId)) return true;
+  seenMessageIds.set(msgId, now);
+  return false;
+}
+
 function getSession(userId) {
   if (!conversations.has(userId)) {
     conversations.set(userId, {
@@ -167,17 +179,35 @@ async function sendWithNavFooter(to, bodyText) {
 
 // ── Claude helpers ────────────────────────────────────────────────────────────
 
-function parseClaudeResponse(raw) {
+function extractJson(str) {
+  // Strip markdown code fences Claude sometimes adds
+  const stripped = str.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   try {
-    const parsed = JSON.parse(raw.trim());
+    return JSON.parse(stripped);
+  } catch {
+    // Try pulling the first {...} block out of surrounding prose
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch { /* not JSON */ }
+    }
+    return null;
+  }
+}
+
+function parseClaudeResponse(raw) {
+  const parsed = extractJson(raw);
+  if (parsed) {
     if (parsed.outOfScope === true) return { outOfScope: true };
     if (parsed.confused === true) return { confused: true };
-    if (typeof parsed.body === "string" && Array.isArray(parsed.buttons) && parsed.buttons.length) {
-      return { body: parsed.body, buttons: parsed.buttons.slice(0, 3) };
+    if (typeof parsed.body === "string") {
+      if (Array.isArray(parsed.buttons) && parsed.buttons.length) {
+        return { body: parsed.body, buttons: parsed.buttons.slice(0, 3) };
+      }
+      // JSON with body but no buttons — treat as plain text response
+      return { body: parsed.body, buttons: null };
     }
-  } catch {
-    // plain text — fall through
   }
+  // Truly plain text
   return { body: raw, buttons: null };
 }
 
@@ -281,6 +311,13 @@ app.post("/webhook", async (req, res) => {
     if (!value?.messages) return res.sendStatus(200);
 
     const message = value.messages[0];
+
+    // Deduplicate — WhatsApp Cloud API can fire the same event twice
+    if (message.id && isDuplicateMessage(message.id)) {
+      console.log(`[webhook] duplicate message id=${message.id} — skipping`);
+      return res.sendStatus(200);
+    }
+
     console.log("[webhook] message.type:", message.type);
 
     // Unsupported media — reply and bail
@@ -380,7 +417,8 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("[webhook] error:", err?.response?.data ?? err.message);
-    res.sendStatus(500);
+    // Return 200 so Meta does not retry — the error is already logged
+    res.sendStatus(200);
   }
 });
 
