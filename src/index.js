@@ -73,6 +73,16 @@ async function getClaudeReply(userId, userMessage) {
   return reply;
 }
 
+// ── Debug routes ─────────────────────────────────────────────────────────────
+
+app.get("/test", (_req, res) => {
+  res.json({ status: "ok", verify_token_set: !!process.env.WHATSAPP_VERIFY_TOKEN });
+});
+
+app.get("/webhook-test", (req, res) => {
+  res.json(req.query);
+});
+
 // ── Webhook routes ────────────────────────────────────────────────────────────
 
 // GET  /webhook — verification handshake required by Meta
