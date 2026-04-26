@@ -22,16 +22,18 @@ Step 2 — Show a 3–5 item cart summary with prices, then: {"body":"Cart total
 Step 3 — After confirm: plain text confirmation with 10–20 min delivery.
 
 DINE OUT:
-Step 1 — Ask occasion: {"body":"What's the occasion? 🍴","buttons":["👫 Date Night","👨‍👩‍👧 Family","💼 Business","😊 Casual"]}
-  Note: max 3 buttons — use Casual/Date/Family for first pass; offer Business if they ask.
+Step 1 — Ask occasion: {"body":"What's the occasion? 🍴","buttons":["👫 Date Night","👨‍👩‍👧 Family","😊 Casual"]}
 Step 2 — Suggest ONE restaurant with vibe: {"body":"Fatty Bao, Indiranagar — great ambience, Asian fusion. Perfect for a date! 🥢","buttons":["📅 Book Table","🔄 Different Venue"]}
 Step 3 — After book: plain text reservation confirmation with time slot.
+
+SPECIAL RESPONSES — return these exact JSON objects and nothing else:
+- User asks about anything NOT food/restaurants/groceries/dining (weather, sports, news, tech, etc.): {"outOfScope":true}
+- You genuinely don't understand the user's food-related request: {"confused":true}
 
 RULES:
 - When offering 2–3 choices → respond ONLY with: {"body":"...","buttons":["A","B","C"]}
 - Button titles max 20 chars
-- For all other responses (info, confirmations, questions without choices) → respond with plain text only
-- If you don't understand or get off-topic → {"body":"Hmm, didn't catch that! What would you like to do? 😊","buttons":["🍽️ Order Food","🛒 Groceries","🍴 Dine Out"]}
+- All other responses → plain text only
 - Never leave the user without a next step`;
 
 const MAIN_MENU_BUTTONS = ["🍽️ Order Food", "🛒 Groceries", "🍴 Dine Out"];
@@ -47,8 +49,50 @@ const NAV_ROWS = [
   { id: "nav_help", title: "❓ Help" },
 ];
 
+const FALLBACK_MESSAGES = [
+  "Hmm, didn't catch that 😅 What can I help you with?",
+  "That's outside my food zone 🍽️ Let me help you order!",
+  "I only speak food! Let me help you with that 🍱",
+  "Not sure what you mean — let me show you what I can do!",
+];
+
+// Per-user session: Claude message history + error-tracking metadata
 const conversations = new Map();
 const MAX_HISTORY = 20;
+
+function getSession(userId) {
+  if (!conversations.has(userId)) {
+    conversations.set(userId, {
+      history: [],
+      errorCount: 0,
+      lastMsgs: [],      // last 3 user texts for stuck detection
+      usedErrorIdxs: [], // fallback message rotation state
+    });
+  }
+  return conversations.get(userId);
+}
+
+function getNextErrorMessage(session) {
+  if (session.usedErrorIdxs.length >= FALLBACK_MESSAGES.length) {
+    session.usedErrorIdxs = [];
+  }
+  const available = FALLBACK_MESSAGES
+    .map((_, i) => i)
+    .filter((i) => !session.usedErrorIdxs.includes(i));
+  const idx = available[Math.floor(Math.random() * available.length)];
+  session.usedErrorIdxs.push(idx);
+  return FALLBACK_MESSAGES[idx];
+}
+
+function trackMessage(session, userText) {
+  session.lastMsgs.push(userText);
+  if (session.lastMsgs.length > 3) session.lastMsgs.shift();
+}
+
+function isStuck(session) {
+  const last = session.lastMsgs;
+  return last.length >= 3 && last.slice(-3).every((m) => m === last.at(-1));
+}
 
 // ── WhatsApp helpers ──────────────────────────────────────────────────────────
 
@@ -61,6 +105,14 @@ function whatsappHeaders() {
 
 function whatsappUrl() {
   return `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+}
+
+async function sendWhatsAppText(to, text) {
+  await axios.post(
+    whatsappUrl(),
+    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
+    { headers: whatsappHeaders() }
+  );
 }
 
 async function sendWhatsAppButtons(to, bodyText, buttons) {
@@ -91,7 +143,6 @@ async function sendWhatsAppButtons(to, bodyText, buttons) {
   );
 }
 
-// Sends a list message — used for all non-button responses so nav footer is always present
 async function sendWithNavFooter(to, bodyText) {
   console.log(`[sendList] to=${to} body="${bodyText}"`);
   await axios.post(
@@ -119,6 +170,8 @@ async function sendWithNavFooter(to, bodyText) {
 function parseClaudeResponse(raw) {
   try {
     const parsed = JSON.parse(raw.trim());
+    if (parsed.outOfScope === true) return { outOfScope: true };
+    if (parsed.confused === true) return { confused: true };
     if (typeof parsed.body === "string" && Array.isArray(parsed.buttons) && parsed.buttons.length) {
       return { body: parsed.body, buttons: parsed.buttons.slice(0, 3) };
     }
@@ -128,35 +181,50 @@ function parseClaudeResponse(raw) {
   return { body: raw, buttons: null };
 }
 
-async function getClaudeReply(userId, userMessage) {
-  if (!conversations.has(userId)) {
-    conversations.set(userId, []);
-  }
-
-  const history = conversations.get(userId);
+async function getClaudeReply(session, userMessage) {
+  const { history } = session;
   history.push({ role: "user", content: userMessage });
+  while (history.length > MAX_HISTORY) history.splice(0, 2);
 
-  while (history.length > MAX_HISTORY) {
-    history.splice(0, 2);
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+      messages: history,
+    });
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? '{"confused":true}';
+    history.push({ role: "assistant", content: raw });
+    return parseClaudeResponse(raw);
+  } catch (err) {
+    console.error("[claude] API error:", err.message);
+    history.pop(); // allow retry — don't poison history with unanswered message
+    return { apiError: true };
   }
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1024,
-    system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
-    messages: history,
-  });
-
-  const raw =
-    response.content.find((b) => b.type === "text")?.text ??
-    '{"body":"Something went wrong. Let\'s start fresh!","buttons":["🍽️ Order Food","🛒 Groceries","🍴 Dine Out"]}';
-
-  history.push({ role: "assistant", content: raw });
-
-  return parseClaudeResponse(raw);
 }
 
-// ── Nav command helpers ───────────────────────────────────────────────────────
+// ── Error & fallback handlers ─────────────────────────────────────────────────
+
+async function handleTieredError(from, session) {
+  session.errorCount++;
+  console.log(`[error] tier ${session.errorCount} for ${from}`);
+
+  if (session.errorCount >= 3) {
+    conversations.delete(from);
+    await sendWhatsAppButtons(from, "Let me take you back to the start 🔄", MAIN_MENU_BUTTONS);
+    return;
+  }
+
+  if (session.errorCount === 2) {
+    await sendWhatsAppButtons(from, "Here's what Sous can help with:", MAIN_MENU_BUTTONS);
+    return;
+  }
+
+  await sendWhatsAppButtons(from, getNextErrorMessage(session), MAIN_MENU_BUTTONS);
+}
+
+// ── Nav helpers ───────────────────────────────────────────────────────────────
 
 function isNavId(id) {
   return id === "nav_main_menu" || id === "nav_start_over" || id === "nav_help";
@@ -192,14 +260,14 @@ app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
   if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
     console.log("Webhook verified ✓");
     return res.status(200).send(challenge);
   }
-
   res.sendStatus(403);
 });
+
+const UNSUPPORTED_TYPES = new Set(["audio", "image", "video", "document", "sticker"]);
 
 app.post("/webhook", async (req, res) => {
   console.log("[webhook] POST received");
@@ -210,12 +278,20 @@ app.post("/webhook", async (req, res) => {
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    if (!value?.messages) {
-      return res.sendStatus(200);
-    }
+    if (!value?.messages) return res.sendStatus(200);
 
     const message = value.messages[0];
     console.log("[webhook] message.type:", message.type);
+
+    // Unsupported media — reply and bail
+    if (UNSUPPORTED_TYPES.has(message.type)) {
+      await new Promise((r) => setTimeout(r, 1000));
+      await sendWhatsAppText(
+        message.from,
+        "I can only read text for now 😊 Type what you need and I'll sort it out!"
+      );
+      return res.sendStatus(200);
+    }
 
     let from, userText, isNavCommand = false;
 
@@ -223,12 +299,10 @@ app.post("/webhook", async (req, res) => {
       from = message.from;
       userText = message.text.body;
     } else if (message.type === "interactive") {
-      const buttonReply = message.interactive?.button_reply;
       const listReply = message.interactive?.list_reply;
-
+      const buttonReply = message.interactive?.button_reply;
       if (listReply) {
         from = message.from;
-        // List replies are always nav commands — use ID for clean matching
         userText = listReply.id;
         isNavCommand = isNavId(listReply.id);
         console.log(`[webhook] list_reply from=${from} id="${listReply.id}"`);
@@ -244,33 +318,60 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Typing simulation — do before any async WhatsApp calls
+    // Typing simulation
     await new Promise((r) => setTimeout(r, 1000));
 
-    // New user — send welcome, init empty history
+    // New user — welcome + init session
     if (!conversations.has(from)) {
       console.log("[webhook] new user — sending welcome");
       await sendWhatsAppButtons(from, WELCOME.body, WELCOME.buttons);
-      conversations.set(from, []);
+      getSession(from);
       return res.sendStatus(200);
     }
 
-    // Persistent nav command (tapped list footer item)
+    // Nav footer tap
     if (isNavCommand) {
       console.log(`[webhook] nav command: ${userText}`);
       await handleNavCommand(from, userText);
       return res.sendStatus(200);
     }
 
-    // Normal message — ask Claude
-    console.log("[webhook] calling Claude...");
-    const { body, buttons } = await getClaudeReply(from, userText);
-    console.log(`[webhook] Claude body="${body}" buttons=${JSON.stringify(buttons)}`);
+    const session = getSession(from);
 
-    if (buttons && buttons.length > 0) {
-      await sendWhatsAppButtons(from, body, buttons);
+    // Track before checking — stuck fires on 3rd identical message
+    trackMessage(session, userText);
+    if (isStuck(session)) {
+      console.log(`[webhook] stuck detected for ${from}`);
+      conversations.delete(from);
+      await sendWhatsAppButtons(
+        from,
+        "Looks like you're stuck! Let me reset and start fresh 🔄",
+        MAIN_MENU_BUTTONS
+      );
+      return res.sendStatus(200);
+    }
+
+    console.log("[webhook] calling Claude...");
+    const result = await getClaudeReply(session, userText);
+    console.log(`[webhook] result:`, JSON.stringify(result));
+
+    if (result.apiError || result.confused) {
+      await handleTieredError(from, session);
+    } else if (result.outOfScope) {
+      session.errorCount = 0; // out-of-scope is handled, not an error
+      await sendWhatsAppButtons(
+        from,
+        "I'm Sous — I only know food! 🍽️ Here's what I can help with:",
+        MAIN_MENU_BUTTONS
+      );
     } else {
-      await sendWithNavFooter(from, body);
+      session.errorCount = 0;
+      const { body, buttons } = result;
+      if (buttons && buttons.length > 0) {
+        await sendWhatsAppButtons(from, body, buttons);
+      } else {
+        await sendWithNavFooter(from, body);
+      }
     }
 
     console.log(`[webhook] reply delivered to ${from}`);
