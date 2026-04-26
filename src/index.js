@@ -75,7 +75,7 @@ async function getClaudeReply(userId, userMessage) {
 // ── Debug routes ─────────────────────────────────────────────────────────────
 
 app.get("/test", (_req, res) => {
-  res.json({ status: "ok", verify_token_set: !!process.env.WHATSAPP_VERIFY_TOKEN });
+  res.json({ status: "ok", verify_token_set: !!process.env.VERIFY_TOKEN });
 });
 
 app.get("/webhook-test", (req, res) => {
@@ -90,7 +90,7 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
     console.log("Webhook verified ✓");
     return res.status(200).send(challenge);
   }
