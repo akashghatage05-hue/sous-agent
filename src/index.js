@@ -121,9 +121,13 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ── Start server ──────────────────────────────────────────────────────────────
+// ── Export for Vercel (serverless); listen only when run directly ─────────────
 
-const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => {
-  console.log(`Sous bot listening on port ${PORT}`);
-});
+export default app;
+
+if (process.env.NODE_ENV !== "production") {
+  const PORT = process.env.PORT ?? 3000;
+  app.listen(PORT, () => {
+    console.log(`Sous bot listening on port ${PORT}`);
+  });
+}
